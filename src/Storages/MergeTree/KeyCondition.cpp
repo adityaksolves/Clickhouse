@@ -948,6 +948,71 @@ static const ActionsDAG::Node * tryRewriteCoalesceComparison(
     return &inverted_dag.addFunction(or_func, std::move(or_children), "");
 }
 
+static const ActionsDAG::Node * tryRewriteNullIfComparison(
+    const ActionsDAG::Node & node,
+    const String & op_name,
+    ActionsDAG & inverted_dag,
+    std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> & inputs_mapping,
+    const ContextPtr & context)
+{
+    if (node.children.size() != 2)
+        return nullptr;
+
+    auto mirrored_op = [](std::string_view op) -> std::string_view
+    {
+        if (op == "equals") return "equals";
+        if (op == "less") return "greater";
+        if (op == "greater") return "less";
+        if (op == "lessOrEquals") return "greaterOrEquals";
+        if (op == "greaterOrEquals") return "lessOrEquals";
+        return {};
+    };
+
+    const std::string_view mirrored = mirrored_op(op_name);
+    if (mirrored.empty())
+        return nullptr;
+
+    auto is_const = [](const ActionsDAG::Node & n)
+    {
+        return n.type == ActionsDAG::ActionType::COLUMN;
+    };
+
+    const bool c0 = is_const(*node.children[0]);
+    const bool c1 = is_const(*node.children[1]);
+    if (c0 == c1)
+        return nullptr;
+
+    const ActionsDAG::Node * nullif_node = node.children[c0 ? 1 : 0];
+    const ActionsDAG::Node * const_node = node.children[c0 ? 0 : 1];
+    const std::string_view canonical_op = c0 ? mirrored : std::string_view{op_name};
+
+    if (nullif_node->type != ActionsDAG::ActionType::FUNCTION)
+        return nullptr;
+
+    const auto & function_name = nullif_node->function_base->getName();
+    if (function_name != "nullIf")
+        return nullptr;
+
+    if (nullif_node->children.size() != 2)
+        return nullptr;
+
+    if (canonical_op != "equals")
+        return nullptr;
+
+    const auto * col_node = nullif_node->children[0];
+    const auto * sentinel_node = nullif_node->children[1];
+
+    if (is_const(*sentinel_node) && ((*sentinel_node->column)[0] == (*const_node->column)[0]))
+        return nullptr;
+
+    auto function_builder = FunctionFactory::instance().get(String(canonical_op), context);
+    if (!function_builder)
+        return nullptr;
+
+    ActionsDAG::NodeRawConstPtrs args = {col_node, const_node};
+    return &inverted_dag.addFunction(function_builder, args, "");
+}
+
 static const ActionsDAG::Node & cloneDAGWithInversionPushDown(
     const ActionsDAG::Node & node,
     ActionsDAG & inverted_dag,
@@ -1067,7 +1132,8 @@ static const ActionsDAG::Node & cloneDAGWithInversionPushDown(
             }
             else if (!need_inversion
                 && context->getSettingsRef()[Setting::allow_key_condition_coalesce_rewrite]
-                && (res = tryRewriteCoalesceComparison(node, name, inverted_dag, inputs_mapping, context)) != nullptr)
+                && ((res = tryRewriteCoalesceComparison(node, name, inverted_dag, inputs_mapping, context)) != nullptr
+                    || (res = tryRewriteNullIfComparison(node, name, inverted_dag, inputs_mapping, context)) != nullptr))
             {
                 handled_inversion = true;
             }
