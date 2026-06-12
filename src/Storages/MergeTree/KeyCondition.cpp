@@ -952,7 +952,7 @@ static const ActionsDAG::Node * tryRewriteNullIfComparison(
     const ActionsDAG::Node & node,
     const String & op_name,
     ActionsDAG & inverted_dag,
-    std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> & inputs_mapping,
+    std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> & /* inputs_mapping */,
     const ContextPtr & context)
 {
     if (node.children.size() != 2)
