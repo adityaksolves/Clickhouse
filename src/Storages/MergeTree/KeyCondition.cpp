@@ -961,6 +961,7 @@ static const ActionsDAG::Node * tryRewriteNullIfComparison(
     auto mirrored_op = [](std::string_view op) -> std::string_view
     {
         if (op == "equals") return "equals";
+        if (op == "notEquals") return "notEquals";
         if (op == "less") return "greater";
         if (op == "greater") return "less";
         if (op == "lessOrEquals") return "greaterOrEquals";
@@ -974,7 +975,7 @@ static const ActionsDAG::Node * tryRewriteNullIfComparison(
 
     auto is_const = [](const ActionsDAG::Node & n)
     {
-        return n.type == ActionsDAG::ActionType::COLUMN;
+        return n.column && isColumnConst(*n.column);
     };
 
     const bool c0 = is_const(*node.children[0]);
@@ -996,14 +997,22 @@ static const ActionsDAG::Node * tryRewriteNullIfComparison(
     if (nullif_node->children.size() != 2)
         return nullptr;
 
-    if (canonical_op != "equals")
+    if (canonical_op != "equals" && canonical_op != "notEquals")
         return nullptr;
 
     const auto * col_node = nullif_node->children[0];
     const auto * sentinel_node = nullif_node->children[1];
 
-    if (is_const(*sentinel_node) && ((*sentinel_node->column)[0] == (*const_node->column)[0]))
-        return nullptr;
+    if (is_const(*sentinel_node))
+    {
+        Field sentinel_field;
+        Field const_field;
+        sentinel_node->column->get(0, sentinel_field);
+        const_node->column->get(0, const_field);
+
+        if (sentinel_field == const_field)
+            return nullptr;
+    }
 
     auto function_builder = FunctionFactory::instance().get(String(canonical_op), context);
     if (!function_builder)
