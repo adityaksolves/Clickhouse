@@ -905,12 +905,18 @@ VectorWithMemoryTracking<Chain> InsertDependenciesBuilder::createChainWithDepend
     VectorWithMemoryTracking<Chain> result_chains;
     result_chains.reserve(result_data.size());
 
+    const auto & settings = init_context->getSettingsRef();
     for (auto & [processor_list, resources] : result_data)
     {
         auto & chain = result_chains.emplace_back(std::move(processor_list));
         chain.attachResources(std::move(resources));
-        chain.setNumThreads(init_context->getSettingsRef()[Setting::max_threads]);
-        chain.setConcurrencyControl(init_context->getSettingsRef()[Setting::use_concurrency_control]);
+
+        if (!settings[Setting::parallel_view_processing] && isViewsInvolved())
+            chain.setNumThreads(1);
+        else
+            chain.setNumThreads(settings[Setting::max_threads]);
+
+        chain.setConcurrencyControl(settings[Setting::use_concurrency_control]);
     }
 
     return result_chains;
@@ -958,8 +964,14 @@ Chain InsertDependenciesBuilder::createChainWithDependencies() const
         result.addSink(std::make_shared<NullSinkToStorage>(output_headers.at(root_view)));
     }
 
-    result.setNumThreads(init_context->getSettingsRef()[Setting::max_threads]);
-    result.setConcurrencyControl(init_context->getSettingsRef()[Setting::use_concurrency_control]);
+    {
+        const auto & settings_ref = init_context->getSettingsRef();
+        if (!settings_ref[Setting::parallel_view_processing] && isViewsInvolved())
+            result.setNumThreads(1);
+        else
+            result.setNumThreads(settings_ref[Setting::max_threads]);
+        result.setConcurrencyControl(settings_ref[Setting::use_concurrency_control]);
+    }
 
     result.addInsertDependenciesBuilder(shared_from_this());
 
