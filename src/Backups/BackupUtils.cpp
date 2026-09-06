@@ -3,10 +3,15 @@
 #include <Backups/DDLAdjustingForBackupVisitor.h>
 #include <Databases/DDLRenamingVisitor.h>
 #include <Databases/LoadingStrictnessLevel.h>
+#include <IO/ReadHelpers.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Storages/TimeSeries/normalizeTimeSeriesDefinition.h>
 #include <Common/typeid_cast.h>
+#include "config.h"
+#if USE_LIBPQXX
+#include <Storages/PostgreSQL/StorageMaterializedPostgreSQL.h>
+#endif
 
 
 namespace DB::BackupUtils
@@ -145,8 +150,28 @@ bool isInnerTable(const QualifiedTableName & table_name)
 
 bool isInnerTable(const String & /* database_name */, const String & table_name)
 {
-    /// We skip inner tables of materialized views. They're backed up by StorageMaterializedView.
-    return table_name.starts_with(".inner.") || table_name.starts_with(".inner_id.") || table_name.starts_with(".tmp.inner.") || table_name.starts_with(".tmp.inner_id.");
+    /// Inner tables of materialized views and of TimeSeries tables. They're backed up through their outer table.
+    if (table_name.starts_with(".inner.") || table_name.starts_with(".inner_id.") || table_name.starts_with(".tmp.inner.") || table_name.starts_with(".tmp.inner_id."))
+        return true;
+
+#if USE_LIBPQXX
+    /// A standalone MaterializedPostgreSQL table keeps its rows in a nested table named
+    /// `<uuid of the outer table>_nested`, see `StorageMaterializedPostgreSQL::getNestedTableName`. That name
+    /// carries no `.inner` prefix, so it has to be recognised by its own shape.
+    ///
+    /// The part before the suffix must parse as a UUID: checking only the suffix would classify an ordinary
+    /// user table called e.g. `events_nested` as inner and silently drop its data from every backup.
+    static constexpr std::string_view nested_suffix = StorageMaterializedPostgreSQL::NESTED_TABLE_SUFFIX;
+    if (table_name.size() > nested_suffix.size() && table_name.ends_with(nested_suffix))
+    {
+        const std::string_view uuid_part{table_name.data(), table_name.size() - nested_suffix.size()};
+        UUID parsed_uuid;
+        if (tryParseUUID({reinterpret_cast<const UInt8 *>(uuid_part.data()), uuid_part.size()}, parsed_uuid))
+            return true;
+    }
+#endif
+
+    return false;
 }
 
 }
