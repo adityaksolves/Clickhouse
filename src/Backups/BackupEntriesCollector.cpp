@@ -27,6 +27,7 @@
 #include <Common/setThreadName.h>
 #include <Common/threadPoolCallbackRunner.h>
 
+#include <algorithm>
 #include <filesystem>
 
 #if CLICKHOUSE_CLOUD
@@ -530,20 +531,17 @@ void BackupEntriesCollector::gatherDatabaseMetadata(
         if (exclude_table_data)
             checkTableCanHaveDataExcluded(database_name, *table_name);
 
-        auto [table_it, inserted] = database_info.tables.try_emplace(*table_name);
-        auto & table_params = table_it->second;
+        auto & table_params = database_info.tables.try_emplace(*table_name).first->second;
         if (throw_if_table_not_found)
             table_params.throw_if_table_not_found = true;
-        if (partitions)
-        {
-            table_params.partitions.emplace();
-            insertAtEnd(*table_params.partitions, *partitions);
-        }
 
-        /// The exclusion is scoped to the element being processed: it applies to this table only, and only
-        /// while no other element asks for the same table without excluding its data (such an element wants
-        /// the data, so it wins - see `DatabaseInfo::TableParams::except_data`).
-        table_params.except_data = inserted ? exclude_table_data : (table_params.except_data && exclude_table_data);
+        /// One call naming a table is one single-table element of the query, so this is where an element's
+        /// own view of the table gets recorded. The partition scope and the exclusion are kept together and
+        /// per element: they are one request, and merging them across elements is what let one element's
+        /// request erase another's (see `DatabaseInfo::TableParams`).
+        auto & element_info = table_params.elements.emplace_back();
+        element_info.partitions = partitions;
+        element_info.except_data = exclude_table_data;
     }
 
     if (all_tables)
@@ -650,8 +648,7 @@ void BackupEntriesCollector::gatherTablesMetadata()
         if (it == database_info.tables.end())
             continue;
 
-        const auto & partitions = it->second.partitions;
-        if (partitions && res_table_info.storage && !res_table_info.storage->supportsBackupPartition())
+        if (it->second.anyElementNamedPartitions() && res_table_info.storage && !res_table_info.storage->supportsBackupPartition())
         {
             throw Exception(
                 ErrorCodes::CANNOT_BACKUP_TABLE,
@@ -659,7 +656,7 @@ void BackupEntriesCollector::gatherTablesMetadata()
                 res_table_info.storage->getName(),
                 tableNameWithTypeToString(qualified_name.database, qualified_name.table, false));
         }
-        res_table_info.partitions = partitions;
+        res_table_info.partitions = it->second.partitionsWithData();
     }
 }
 
@@ -957,6 +954,38 @@ bool BackupEntriesCollector::shouldBackupTableData(
     return true;
 }
 
+bool BackupEntriesCollector::DatabaseInfo::TableParams::anyElementNamedPartitions() const
+{
+    return std::ranges::any_of(elements, [](const auto & element) { return element.partitions.has_value(); });
+}
+
+std::optional<ASTs> BackupEntriesCollector::DatabaseInfo::TableParams::partitionsWithData() const
+{
+    std::optional<ASTs> res;
+
+    for (const auto & element : elements)
+    {
+        /// The element asks for none of the table's data, so it contributes no partitions.
+        if (element.except_data)
+            continue;
+
+        /// The element asks for the whole table, which subsumes any partition another element named.
+        if (!element.partitions)
+            return {};
+
+        if (!res)
+            res.emplace();
+        insertAtEnd(*res, *element.partitions);
+    }
+
+    return res;
+}
+
+bool BackupEntriesCollector::DatabaseInfo::TableParams::isDataExcluded() const
+{
+    return std::ranges::all_of(elements, [](const auto & element) { return element.except_data; });
+}
+
 bool BackupEntriesCollector::DatabaseInfo::isTableSelectedByAnyElement(const String & table_name) const
 {
     /// A table named by an element of its own is selected even when a wider element excludes it: the element
@@ -995,10 +1024,10 @@ bool BackupEntriesCollector::isTableDataExcluded(const QualifiedTableName & tabl
 
     bool wanted_by_any_element = false;
 
-    /// `TableParams::except_data` has already intersected every single-table element naming this table, so it
-    /// is false as soon as one of them asked for the data.
+    /// `TableParams::isDataExcluded` asks every single-table element naming this table, so it is false as
+    /// soon as one of them asked for the data.
     if (auto table_it = database_info.tables.find(table_name.table); table_it != database_info.tables.end())
-        wanted_by_any_element = !table_it->second.except_data;
+        wanted_by_any_element = !table_it->second.isDataExcluded();
 
     for (const auto & element : database_info.all_tables_elements)
     {

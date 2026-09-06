@@ -160,13 +160,37 @@ private:
         struct TableParams
         {
             bool throw_if_table_not_found = false;
-            std::optional<ASTs> partitions;
 
-            /// The table was named by a single-table element (TABLE/DICTIONARY/VIEW/TEMPORARY TABLE) which
-            /// carried EXCEPT DATA FROM TABLE, and by no such element which didn't. An element asking for the
-            /// table without that clause asks for its data, so it keeps the data in the backup: we would
-            /// rather back up data the user meant to exclude than silently drop data they asked for.
-            bool except_data = false;
+            /// One entry per single-table element (TABLE/DICTIONARY/VIEW/TEMPORARY TABLE) naming this table,
+            /// holding that element's own partition scope and whether it excluded the table's data.
+            ///
+            /// The elements are kept apart rather than merged for the same reason `AllTablesElement` keeps
+            /// wide elements apart: both questions asked of them are per element. Merging the partition
+            /// scopes let a later element erase what an earlier one asked for, and reducing the exclusions to
+            /// one boolean per table left no way to say which partitions an element wanted the data of.
+            struct SingleTableElement
+            {
+                /// Partitions this element asked for; no value means the whole table.
+                std::optional<ASTs> partitions;
+                /// This element carried EXCEPT DATA FROM TABLE, so it asks for none of the table's data.
+                bool except_data = false;
+            };
+            std::vector<SingleTableElement> elements;
+
+            /// Whether any element named partitions at all. Asked only to validate the query against table
+            /// engines that cannot back up partitions, which is a user error worth reporting even when the
+            /// data is excluded anyway.
+            bool anyElementNamedPartitions() const;
+
+            /// The partitions whose data reaches the backup: the union over the elements that ask for data,
+            /// or no value (meaning the whole table) as soon as one of those elements named no partitions.
+            /// An element asking for the table without EXCEPT DATA FROM TABLE is asking for its data, and
+            /// that request wins - we would rather back up data the user meant to exclude than silently drop
+            /// data they asked for.
+            std::optional<ASTs> partitionsWithData() const;
+
+            /// No element naming this table asks for any of its data.
+            bool isDataExcluded() const;
         };
 
         /// Tables named explicitly by single-table elements of the BACKUP query.
