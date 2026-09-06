@@ -188,9 +188,14 @@ bool isInnerTableForBackup(const String & database_name, const String & table_na
     if (!materialized_postgresql)
         return false;
 
-    /// The outer table must be in the same database and must be the one which named this table: a
-    /// MaterializedPostgreSQL *database* engine names its nested tables differently.
-    return materialized_postgresql->getStorageID().database_name == database_name
+    /// The outer table must be in the same database and must be the one which named this table.
+    ///
+    /// `getNestedTableName` returns the storage's own name when it belongs to a MaterializedPostgreSQL
+    /// *database* engine, which names its nested tables differently. A table of such a database called
+    /// `<its own uuid>_nested` would therefore answer this question about itself, so require the outer
+    /// table to be a different table: a nested table is never its own outer table.
+    const auto outer_table_id = materialized_postgresql->getStorageID();
+    return outer_table_id.database_name == database_name && outer_table_id.table_name != table_name
         && materialized_postgresql->getNestedTableName() == table_name;
 #else
     return false;
