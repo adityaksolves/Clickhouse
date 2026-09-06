@@ -815,3 +815,118 @@ def test_except_data_from_materialized_postgresql_nested_table():
 
     instance.query(f"DROP TABLE IF EXISTS default.{pg_table} SYNC")
     pg_manager.execute(f"DROP TABLE IF EXISTS {pg_table}")
+
+
+def test_except_data_overlapping_table_and_database_elements_keep_data():
+    """A table's data survives when another element of the same query asks for the table itself.
+
+    `BACKUP TABLE db.t EXCEPT DATA FROM TABLE db.t, DATABASE db` names `db.t` twice: once with the
+    clause and once, through `DATABASE db`, without it. The element that did not write the clause is
+    asking for the data, and that request has to win - writing data the user meant to drop is a much
+    smaller harm than silently dropping data they asked for.
+
+    Before the fix `isTableDataExcluded` returned the single-table element's answer and never looked
+    at the `DATABASE` element, so the data was dropped.
+    """
+    instance.query("DROP DATABASE IF EXISTS overlap_db")
+    instance.query("CREATE DATABASE overlap_db")
+    instance.query("CREATE TABLE overlap_db.t (id UInt64) ENGINE = MergeTree ORDER BY id")
+    instance.query("INSERT INTO overlap_db.t VALUES (1), (2), (3)")
+
+    # Control: the same clause with no second element really does drop the data. Without this arm
+    # the assertion below would also pass if the clause had stopped working altogether.
+    control_backup = new_backup_name()
+    instance.query(
+        f"BACKUP TABLE overlap_db.t EXCEPT DATA FROM TABLE overlap_db.t TO {control_backup}"
+    )
+
+    overlapping_backup = new_backup_name()
+    instance.query(
+        f"BACKUP TABLE overlap_db.t EXCEPT DATA FROM TABLE overlap_db.t, DATABASE overlap_db "
+        f"TO {overlapping_backup}"
+    )
+
+    instance.query("DROP TABLE overlap_db.t")
+    instance.query(f"RESTORE TABLE overlap_db.t FROM {control_backup}")
+    assert instance.query("SELECT count() FROM overlap_db.t") == "0\n"
+
+    instance.query("DROP TABLE overlap_db.t")
+    instance.query(f"RESTORE TABLE overlap_db.t FROM {overlapping_backup}")
+    assert instance.query("SELECT count() FROM overlap_db.t") == "3\n"
+
+    instance.query("DROP DATABASE overlap_db")
+
+
+def test_except_data_overlapping_database_and_all_elements_keep_data():
+    """The same rule across a `DATABASE` element and an `ALL` element.
+
+    `BACKUP DATABASE db, ALL EXCEPT DATA FROM TABLE db.t` writes the clause on the `ALL` element
+    only. `DATABASE db` selects `db.t` without excluding its data, so the data stays.
+    """
+    instance.query("DROP DATABASE IF EXISTS overlap_db")
+    instance.query("CREATE DATABASE overlap_db")
+    instance.query("CREATE TABLE overlap_db.t (id UInt64) ENGINE = MergeTree ORDER BY id")
+    instance.query("INSERT INTO overlap_db.t VALUES (1), (2), (3)")
+
+    # Control: the `ALL` element on its own drops the data, so the difference below is the second
+    # element and nothing else. `system` is excluded to avoid system table restore conflicts.
+    control_backup = new_backup_name()
+    instance.query(
+        f"BACKUP ALL EXCEPT DATABASE system EXCEPT DATA FROM TABLE overlap_db.t TO {control_backup}"
+    )
+
+    overlapping_backup = new_backup_name()
+    instance.query(
+        f"BACKUP DATABASE overlap_db, ALL EXCEPT DATABASE system "
+        f"EXCEPT DATA FROM TABLE overlap_db.t TO {overlapping_backup}"
+    )
+
+    instance.query("DROP DATABASE overlap_db")
+    instance.query(f"RESTORE DATABASE overlap_db FROM {control_backup}")
+    assert instance.query("SELECT count() FROM overlap_db.t") == "0\n"
+
+    instance.query("DROP DATABASE overlap_db")
+    instance.query(f"RESTORE DATABASE overlap_db FROM {overlapping_backup}")
+    assert instance.query("SELECT count() FROM overlap_db.t") == "3\n"
+
+    instance.query("DROP DATABASE overlap_db")
+
+
+def test_except_data_excluded_by_every_element_is_still_excluded():
+    """The fail-safe rule must not turn into "never exclude anything".
+
+    Two cases where no element asks for the data, so it still has to be dropped: every element that
+    selects the table excludes its data, and an element that excludes the table itself - which
+    therefore expresses no wish about its data at all.
+    """
+    instance.query("DROP DATABASE IF EXISTS overlap_db")
+    instance.query("CREATE DATABASE overlap_db")
+    instance.query("CREATE TABLE overlap_db.t (id UInt64) ENGINE = MergeTree ORDER BY id")
+    instance.query("INSERT INTO overlap_db.t VALUES (1), (2), (3)")
+
+    # Both elements select the table and both exclude its data.
+    both_exclude = new_backup_name()
+    instance.query(
+        f"BACKUP DATABASE overlap_db EXCEPT DATA FROM TABLE overlap_db.t, "
+        f"TABLE overlap_db.t EXCEPT DATA FROM TABLE overlap_db.t TO {both_exclude}"
+    )
+
+    # The `DATABASE` element does not select `t` at all, so it is not an element asking for its
+    # data. It is written last because `EXCEPT TABLES t, TABLE ...` does not parse - the name list
+    # swallows the comma before the next element, which is how `EXCEPT TABLES` behaves on master
+    # too and is unrelated to this fix.
+    except_tables = new_backup_name()
+    instance.query(
+        f"BACKUP TABLE overlap_db.t EXCEPT DATA FROM TABLE overlap_db.t, "
+        f"DATABASE overlap_db EXCEPT TABLES t TO {except_tables}"
+    )
+
+    instance.query("DROP TABLE overlap_db.t")
+    instance.query(f"RESTORE TABLE overlap_db.t FROM {both_exclude}")
+    assert instance.query("SELECT count() FROM overlap_db.t") == "0\n"
+
+    instance.query("DROP TABLE overlap_db.t")
+    instance.query(f"RESTORE TABLE overlap_db.t FROM {except_tables}")
+    assert instance.query("SELECT count() FROM overlap_db.t") == "0\n"
+
+    instance.query("DROP DATABASE overlap_db")
