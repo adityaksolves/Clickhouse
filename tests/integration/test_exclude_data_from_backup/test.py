@@ -1,13 +1,18 @@
 import pytest
 
 from helpers.cluster import ClickHouseCluster
+from helpers.config_cluster import pg_pass
+from helpers.postgres_utility import PostgresManager, check_tables_are_synchronized
 
 cluster = ClickHouseCluster(__file__)
 instance = cluster.add_instance(
     "instance",
     main_configs=["configs/backups_disk.xml"],
     external_dirs=["/backups/"],
+    with_postgres=True,
 )
+
+pg_manager = PostgresManager()
 
 backup_id_counter = 0
 
@@ -22,6 +27,12 @@ def new_backup_name():
 def start_cluster():
     try:
         cluster.start()
+        pg_manager.init(
+            instance,
+            cluster.postgres_ip,
+            cluster.postgres_port,
+            default_database="postgres_database",
+        )
         yield cluster
     finally:
         cluster.shutdown()
@@ -713,3 +724,94 @@ def test_except_data_from_system_users_keeps_entry_without_entities():
     )
 
     instance.query("DROP USER IF EXISTS u_except_data")
+
+
+def test_except_data_from_materialized_postgresql_nested_table():
+    """A standalone MaterializedPostgreSQL table keeps its rows in a `<uuid>_nested` table.
+
+    That nested table is internal, so it must not be reachable as a table of its own: naming it in
+    the clause is rejected, and it is never enumerated as a separate element of a database backup.
+    Its data reaches the backup only through the outer table, which is what makes
+    `EXCEPT DATA FROM TABLE <outer>` able to suppress it.
+
+    Before the fix `BackupUtils::isInnerTable` recognised only the `.inner_id.*` families, so the
+    nested table was collected on its own and its rows were written to the backup even when the
+    outer table had been excluded.
+    """
+    pg_table = "mpg_except_data"
+
+    pg_manager.execute(f"DROP TABLE IF EXISTS {pg_table}")
+    pg_manager.create_postgres_table(pg_table)
+    instance.query(
+        f"INSERT INTO postgres_database.{pg_table} SELECT number, number FROM numbers(1000)"
+    )
+
+    instance.query(f"DROP TABLE IF EXISTS default.{pg_table} SYNC")
+    instance.query(
+        f"""
+        SET allow_experimental_materialized_postgresql_table=1;
+        CREATE TABLE default.{pg_table} (key Int32, value Int32)
+        ENGINE=MaterializedPostgreSQL('{cluster.postgres_ip}:{cluster.postgres_port}', 'postgres_database', '{pg_table}', 'postgres', '{pg_pass}')
+        ORDER BY key
+        """
+    )
+    check_tables_are_synchronized(
+        instance,
+        pg_table,
+        postgres_database=pg_manager.get_default_database(),
+        materialized_database="default",
+    )
+
+    nested_table = instance.query(
+        "SELECT toString(uuid) || '_nested' FROM system.tables "
+        f"WHERE database = 'default' AND name = '{pg_table}'"
+    ).strip()
+    assert nested_table.endswith("_nested"), nested_table
+
+    def backup_files(backup_id):
+        listing = instance.exec_in_container(
+            [
+                "bash",
+                "-c",
+                f"find /backups/{backup_id} -type f | sed 's|/backups/{backup_id}/||' | sort",
+            ]
+        )
+        return [line for line in listing.splitlines() if line]
+
+    # 1. Control: without the clause the rows are in the backup, under the OUTER table's path.
+    instance.query("BACKUP DATABASE default TO Disk('backups', 'mpg_control/')")
+    control = backup_files("mpg_control")
+    # The nested table must not appear as an element of its own. Backup paths escape the table
+    # name (`-` becomes `%2D`), so match the `_nested` marker rather than the raw UUID name.
+    assert not any(
+        path.startswith("data/default/") and "_nested/" in path for path in control
+    ), f"nested table backed up as its own element: {control}"
+    assert any(
+        path.startswith(f"data/default/{pg_table}/") for path in control
+    ), f"outer table has no data in the control backup: {control}"
+
+    # 2. Excluding the outer table suppresses the nested rows too.
+    instance.query(
+        f"BACKUP DATABASE default EXCEPT DATA FROM TABLE {pg_table} "
+        "TO Disk('backups', 'mpg_excluded/')"
+    )
+    excluded = backup_files("mpg_excluded")
+    assert not any(
+        path.startswith("data/default/") and "_nested/" in path for path in excluded
+    ), f"nested table backed up as its own element: {excluded}"
+    assert not any(
+        path.startswith(f"data/default/{pg_table}/") for path in excluded
+    ), f"outer table data was written despite EXCEPT DATA FROM TABLE: {excluded}"
+
+    # 3. Naming the nested table directly is rejected - it is an inner table.
+    with pytest.raises(Exception) as exc_info:
+        instance.query(
+            f"BACKUP DATABASE default EXCEPT DATA FROM TABLE `{nested_table}` "
+            "TO Disk('backups', 'mpg_rejected/')"
+        )
+    assert "INNER_TABLE_NOT_ALLOWED_IN_BACKUP_EXCLUSION" in str(exc_info.value), str(
+        exc_info.value
+    )
+
+    instance.query(f"DROP TABLE IF EXISTS default.{pg_table} SYNC")
+    pg_manager.execute(f"DROP TABLE IF EXISTS {pg_table}")
