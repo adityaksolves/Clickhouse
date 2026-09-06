@@ -111,6 +111,21 @@ namespace
         });
     }
 
+    /// Whether `pos` is at the start of a BACKUP element (`TABLE t`, `DATABASE db`, `ALL`, ...).
+    ///
+    /// A comma in `EXCEPT DATA FROM TABLES a, b` separates two table names, while the same comma in
+    /// `EXCEPT DATA FROM TABLE a, TABLE b` separates the clause from the next element of the query.
+    /// Only what follows the comma tells the two apart, which is what this looks at.
+    bool isAtElementStart(IParser::Pos & pos, Expected & expected)
+    {
+        return ParserKeyword(Keyword::TABLE).checkWithoutMoving(pos, expected)
+            || ParserKeyword(Keyword::DICTIONARY).checkWithoutMoving(pos, expected)
+            || ParserKeyword(Keyword::VIEW).checkWithoutMoving(pos, expected)
+            || ParserKeyword(Keyword::TEMPORARY_TABLE).checkWithoutMoving(pos, expected)
+            || ParserKeyword(Keyword::DATABASE).checkWithoutMoving(pos, expected)
+            || ParserKeyword(Keyword::ALL).checkWithoutMoving(pos, expected);
+    }
+
     bool parseExceptDataTables(IParser::Pos & pos, Expected & expected, const std::optional<String> & database_name, std::set<DatabaseAndTableName> & except_data_tables)
     {
         return IParserBase::wrapParseImpl(pos, [&]
@@ -119,8 +134,19 @@ namespace
                 return false;
 
             std::set<DatabaseAndTableName> result;
+            bool at_first_name = true;
             auto parse_list_element = [&]
             {
+                /// A BACKUP element keyword after a comma means the comma ends this clause and belongs to
+                /// the query's element list. Returning false makes `ParserList::parseUtil` rewind to before
+                /// the comma and finish the list, so `parseElements` sees the element.
+                ///
+                /// The first name is exempt because no comma precedes it, which keeps a table genuinely
+                /// called `all` or `view` nameable; after a comma such a name has to be quoted.
+                if (!at_first_name && isAtElementStart(pos, expected))
+                    return false;
+                at_first_name = false;
+
                 DatabaseAndTableName table_name;
 
                 if (!parseDatabaseAndTableName(pos, expected, table_name.first, table_name.second))
