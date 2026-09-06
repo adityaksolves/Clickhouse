@@ -551,9 +551,19 @@ void BackupEntriesCollector::gatherDatabaseMetadata(
     if (all_tables)
     {
         database_info.all_tables = all_tables;
+
+        /// One call with `all_tables` is one DATABASE or ALL element covering this database, so this is where an
+        /// element's own view of the database gets recorded.
+        auto & element_info = database_info.all_tables_elements.emplace_back();
+
         for (const auto & except_table_name : except_table_names)
-            if (except_table_name.first == database_name)
-                database_info.except_table_names.emplace(except_table_name.second);
+        {
+            if (except_table_name.first != database_name)
+                continue;
+
+            database_info.except_table_names.emplace(except_table_name.second);
+            element_info.except_table_names.emplace(except_table_name.second);
+        }
 
         /// Only a DATABASE or ALL element can name other tables in EXCEPT DATA FROM TABLE/TABLES, and it can
         /// only name tables it selects itself, i.e. tables of the databases it enumerates.
@@ -563,7 +573,7 @@ void BackupEntriesCollector::gatherDatabaseMetadata(
                 continue;
 
             checkTableCanHaveDataExcluded(except_data_table_name.first, except_data_table_name.second);
-            database_info.except_data_table_names.emplace(except_data_table_name.second);
+            element_info.except_data_table_names.emplace(except_data_table_name.second);
         }
     }
 }
@@ -966,15 +976,36 @@ bool BackupEntriesCollector::isTableDataExcluded(const QualifiedTableName & tabl
 
     const auto & database_info = it->second;
 
-    /// A table named by an element of its own is governed by those elements alone: EXCEPT DATA FROM TABLE
-    /// written on a DATABASE or ALL element must not take the data away from an element which asks for the
-    /// table itself. This is the same precedence `findTablesInDatabase` applies to EXCEPT TABLES, where a
-    /// table named explicitly is backed up even though a wider element excluded it.
-    auto table_it = database_info.tables.find(table_name.table);
-    if (table_it != database_info.tables.end())
-        return table_it->second.except_data;
+    /// The data is dropped only when every element selecting this table also excludes its data. An element
+    /// asking for the table without the clause is asking for its data, and that request wins: backing up data
+    /// the user meant to exclude is a far smaller harm than silently dropping data they asked for.
+    ///
+    /// This subsumes the precedence `findTablesInDatabase` applies to EXCEPT TABLES - a table named by an
+    /// element of its own keeps its data even though a wider element excluded it - because such an element is
+    /// one of the elements that wants the data.
+    bool selected_by_any_element = false;
+    bool wanted_by_any_element = false;
 
-    return database_info.except_data_table_names.contains(table_name.table);
+    /// `TableParams::except_data` has already intersected every single-table element naming this table, so it
+    /// is false as soon as one of them asked for the data.
+    if (auto table_it = database_info.tables.find(table_name.table); table_it != database_info.tables.end())
+    {
+        selected_by_any_element = true;
+        wanted_by_any_element = !table_it->second.except_data;
+    }
+
+    for (const auto & element : database_info.all_tables_elements)
+    {
+        /// The element does not select the table at all, so it expresses no wish about its data.
+        if (element.except_table_names.contains(table_name.table))
+            continue;
+
+        selected_by_any_element = true;
+        if (!element.except_data_table_names.contains(table_name.table))
+            wanted_by_any_element = true;
+    }
+
+    return selected_by_any_element && !wanted_by_any_element;
 }
 
 void BackupEntriesCollector::addBackupEntryUnlocked(const String & file_name, BackupEntryPtr backup_entry)

@@ -175,11 +175,22 @@ private:
         bool all_tables = false;
         std::unordered_set<String> except_table_names;
 
-        /// Tables excluded by EXCEPT DATA FROM TABLE/TABLES written on a DATABASE or ALL element covering this
-        /// database. It never holds exclusions coming from a single-table element: those are element-scoped and
-        /// live in `tables[...].except_data`, so a clause written on one element cannot change another element's
-        /// tables. See `isTableDataExcluded` for how the two are combined.
-        std::unordered_set<String> except_data_table_names;
+        /// One entry per DATABASE or ALL element of the query covering this database, holding that element's
+        /// own EXCEPT TABLES and EXCEPT DATA FROM TABLE/TABLES names. Exclusions written on a single-table
+        /// element are not here: those are element-scoped and live in `tables[...].except_data`.
+        ///
+        /// The elements are kept apart rather than merged into one set of names because the question
+        /// `isTableDataExcluded` has to answer is per element - a table's data is dropped only when *every*
+        /// element selecting the table also excludes its data. Merging would erase the elements that asked for
+        /// the data, and their request is the one that must win.
+        struct AllTablesElement
+        {
+            /// Names this element does not select at all, so it has no say about their data.
+            std::unordered_set<String> except_table_names;
+            /// Names this element selects but whose data it excludes.
+            std::unordered_set<String> except_data_table_names;
+        };
+        std::vector<AllTablesElement> all_tables_elements;
     };
 
     struct TableInfo
