@@ -1219,3 +1219,139 @@ def test_except_tables_and_except_data_naming_the_same_table_on_one_element():
     assert instance.query("SELECT count() FROM except_tables_mixed_db.t") == "3\n"
 
     instance.query("DROP DATABASE except_tables_mixed_db")
+
+
+def _create_partitioned_table(database):
+    """A table with two partitions of different sizes, so a restore says which ones survived.
+
+    `part = 1` holds two rows and `part = 2` holds one, so `SELECT part, count() ... GROUP BY part`
+    distinguishes every combination: neither count can be mistaken for the other.
+    """
+    instance.query(f"DROP DATABASE IF EXISTS {database}")
+    instance.query(f"CREATE DATABASE {database}")
+    instance.query(
+        f"CREATE TABLE {database}.t (part UInt8, id UInt64) "
+        f"ENGINE = MergeTree PARTITION BY part ORDER BY id"
+    )
+    instance.query(f"INSERT INTO {database}.t VALUES (1, 1), (1, 2), (2, 3)")
+
+
+def _restored_partitions(database, backup_name):
+    """Drop the table, restore it alone, and report which partitions came back.
+
+    `BACKUP TABLE` carries no database DDL, so the table is dropped and restored on its own while
+    the database stays - `RESTORE DATABASE` would fail here with `UNKNOWN_DATABASE`.
+    """
+    instance.query(f"DROP TABLE {database}.t")
+    instance.query(f"RESTORE TABLE {database}.t FROM {backup_name}")
+    return instance.query(
+        f"SELECT part, count() FROM {database}.t GROUP BY part ORDER BY part"
+    )
+
+
+def test_partition_scope_two_partitioned_elements_union_their_partitions():
+    """Two elements each naming a partition must contribute both, not just the last one.
+
+    Before the fix the partition scopes of the single-table elements were merged into one
+    `std::optional<ASTs>` per table with `emplace()`, which destroys the contained value, so each
+    partitioned element *discarded* what the previous ones had asked for. The result was last-wins:
+    this backup silently dropped `part = 1` although the user named it explicitly.
+
+    No exclusion clause is involved, so this reproduces on plain `BACKUP` and is independent of the
+    `EXCEPT DATA` work - the defect is pre-existing in `master`.
+    """
+    _create_partitioned_table("partition_scope_union_db")
+
+    backup_name = new_backup_name()
+    instance.query(
+        f"BACKUP TABLE partition_scope_union_db.t PARTITION '1', "
+        f"TABLE partition_scope_union_db.t PARTITION '2' TO {backup_name}"
+    )
+
+    # Both partitions were asked for, so both must come back.
+    assert (
+        _restored_partitions("partition_scope_union_db", backup_name) == "1\t2\n2\t1\n"
+    )
+
+    instance.query("DROP DATABASE partition_scope_union_db")
+
+
+def test_partition_scope_element_excluding_data_contributes_no_partitions():
+    """An element carrying `EXCEPT DATA FROM TABLE` must contribute none of its partitions.
+
+    Before the fix this failed in both directions at once: the partition `part = 1` that the first
+    element asked for was erased by the second element's `emplace()`, and the `part = 2` data that
+    the second element excluded was backed up anyway, because the exclusion had been reduced to a
+    single boolean per table and was intersected across elements (`true && false`) rather than kept
+    per element.
+
+    So the assertion pins both halves - the surviving partition is the one that was asked for, and
+    it is the only one.
+    """
+    _create_partitioned_table("partition_scope_excluded_db")
+
+    backup_name = new_backup_name()
+    instance.query(
+        f"BACKUP TABLE partition_scope_excluded_db.t PARTITION '1', "
+        f"TABLE partition_scope_excluded_db.t PARTITION '2' "
+        f"EXCEPT DATA FROM TABLE partition_scope_excluded_db.t TO {backup_name}"
+    )
+
+    # Element 1 asked for `part = 1`'s data and keeps it; element 2 excluded its own data, so it
+    # contributes nothing and `part = 2` must not appear.
+    assert (
+        _restored_partitions("partition_scope_excluded_db", backup_name) == "1\t2\n"
+    )
+
+    instance.query("DROP DATABASE partition_scope_excluded_db")
+
+
+def test_partition_scope_whole_table_element_wins_over_partitioned_element():
+    """An element asking for the whole table must not be narrowed by a later partitioned element.
+
+    The most serious case of the family and the one nobody reported: an element naming the table
+    with no `PARTITION` clause asks for all of it, and a later element naming one partition used to
+    overwrite that request, so the backup silently held one partition of a table the user had asked
+    for in full. Naming a partition is a request for *more* data, never a licence to drop the rest.
+
+    Like the union case this needs no exclusion clause at all.
+    """
+    _create_partitioned_table("partition_scope_whole_table_db")
+
+    backup_name = new_backup_name()
+    instance.query(
+        f"BACKUP TABLE partition_scope_whole_table_db.t, "
+        f"TABLE partition_scope_whole_table_db.t PARTITION '1' TO {backup_name}"
+    )
+
+    # The unpartitioned element subsumes the partitioned one, so the whole table is backed up.
+    assert (
+        _restored_partitions("partition_scope_whole_table_db", backup_name)
+        == "1\t2\n2\t1\n"
+    )
+
+    instance.query("DROP DATABASE partition_scope_whole_table_db")
+
+
+def test_partition_scope_excluded_partitioned_element_leaves_only_the_other():
+    """The over-shoot guard: excluding one partitioned element's data must not exclude the other's.
+
+    This is the ordering where the old merge happened to produce the right answer - the second
+    element's `emplace()` discarded `part = 1` which the first element had excluded anyway, and the
+    intersected boolean came out false, so `part = 2` was backed up either way. It therefore passes
+    both before and after the fix, which is exactly what makes it useful: a fix that over-shot into
+    "an exclusion on any element excludes the table" would drop `part = 2` here and fail.
+    """
+    _create_partitioned_table("partition_scope_guard_db")
+
+    backup_name = new_backup_name()
+    instance.query(
+        f"BACKUP TABLE partition_scope_guard_db.t PARTITION '1' "
+        f"EXCEPT DATA FROM TABLE partition_scope_guard_db.t, "
+        f"TABLE partition_scope_guard_db.t PARTITION '2' TO {backup_name}"
+    )
+
+    # Element 1 excluded its own `part = 1`; element 2 asked for `part = 2` and keeps it.
+    assert _restored_partitions("partition_scope_guard_db", backup_name) == "2\t1\n"
+
+    instance.query("DROP DATABASE partition_scope_guard_db")
