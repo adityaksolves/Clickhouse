@@ -65,7 +65,6 @@ namespace ErrorCodes
     extern const int UNKNOWN_TABLE;
     extern const int LOGICAL_ERROR;
     extern const int INNER_TABLE_NOT_ALLOWED_IN_BACKUP_EXCLUSION;
-    extern const int SYSTEM_TABLE_NOT_ALLOWED_IN_BACKUP_DATA_EXCLUSION;
 }
 
 
@@ -103,19 +102,6 @@ namespace
         return std::min(sleep_time, max_sleep);
     }
 
-    /// Check if a system table's backup contains entities rather than table data.
-    bool isSystemTableWithEntityBackup(const String & database_name, const String & table_name)
-    {
-        if (database_name != DatabaseCatalog::SYSTEM_DATABASE)
-            return false;
-
-        static const std::unordered_set<String> system_tables_with_entity_backup = {
-            "users", "roles", "settings_profiles", "row_policies", "quotas", "functions"
-        };
-
-        return system_tables_with_entity_backup.contains(table_name);
-    }
-
     /// Checks that a table named by EXCEPT DATA FROM TABLE/TABLES is a table whose data can be excluded at all.
     void checkTableCanHaveDataExcluded(const String & database_name, const String & table_name)
     {
@@ -127,21 +113,6 @@ namespace
                 ErrorCodes::INNER_TABLE_NOT_ALLOWED_IN_BACKUP_EXCLUSION,
                 "Inner table names cannot be specified directly in EXCEPT DATA FROM TABLE clause. "
                 "Table: {}.{}. Use the outer table name instead.",
-                backQuoteIfNeed(database_name),
-                backQuoteIfNeed(table_name));
-        }
-
-        /// These system tables are put in a backup as entities (users, roles, functions), not as table data,
-        /// so there is no data to exclude and the clause would silently do nothing.
-        if (isSystemTableWithEntityBackup(database_name, table_name))
-        {
-            throw Exception(
-                ErrorCodes::SYSTEM_TABLE_NOT_ALLOWED_IN_BACKUP_DATA_EXCLUSION,
-                "System table {}.{} cannot be specified in EXCEPT DATA FROM TABLE clause because its backup "
-                "contains entities (users, roles, functions), not table data. Use EXCEPT TABLE {}.{} instead, "
-                "or omit the exclusion clause entirely.",
-                backQuoteIfNeed(database_name),
-                backQuoteIfNeed(table_name),
                 backQuoteIfNeed(database_name),
                 backQuoteIfNeed(table_name));
         }
@@ -667,7 +638,7 @@ void BackupEntriesCollector::gatherTablesMetadata()
     /// partition-related constraints.
     for (auto & [qualified_name, res_table_info] : table_infos)
     {
-        res_table_info.should_backup_data = shouldBackupTableData(qualified_name, res_table_info.storage, res_table_info.create_table_query, rmv_replace_target_ids);
+        res_table_info.should_backup_data = shouldBackupTableData(qualified_name, res_table_info.storage, rmv_replace_target_ids);
 
         if (!res_table_info.should_backup_data)
             continue;
@@ -969,7 +940,6 @@ bool BackupEntriesCollector::shouldBackupTableData(
     const QualifiedTableName & table_name,
     /// Used in the Cloud build.
     [[maybe_unused]] const StoragePtr & storage,
-    [[maybe_unused]] const ASTPtr & create_table_query,
     const std::unordered_set<StorageID, StorageID::DatabaseAndTableNameHash, StorageID::DatabaseAndTableNameEqual> & rmv_replace_target_ids) const
 {
     if (backup_settings.structure_only)
