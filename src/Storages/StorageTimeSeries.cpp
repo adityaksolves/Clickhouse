@@ -41,7 +41,6 @@ namespace Setting
     extern const SettingsBool allow_experimental_time_series_table;
 }
 
-
 namespace ErrorCodes
 {
     extern const int INCORRECT_QUERY;
