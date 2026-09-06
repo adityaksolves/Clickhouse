@@ -674,3 +674,42 @@ def test_except_data_json_table_element_rejects_inconsistent_clause_database():
             "'\"except_data\":true', '\"except_data_database\":\"db1\"'))"
         )
     assert "requires 'except_data'" in str(exc_info.value), str(exc_info.value)
+
+
+def test_except_data_from_system_users_keeps_entry_without_entities():
+    """`EXCEPT DATA FROM TABLE system.users` keeps the table entry but restores no users.
+
+    `system.users` is put in a backup as access entities rather than as table data, so the
+    clause suppresses exactly those entities instead of doing nothing. The control arm - the
+    same backup without the clause - restores the user, which is what makes this a regression
+    guard rather than a test that would also pass if the backup were simply broken.
+    """
+    instance.query("DROP USER IF EXISTS u_except_data")
+    instance.query("CREATE USER u_except_data")
+
+    excluded_backup = new_backup_name()
+    instance.query(
+        f"BACKUP TABLE system.users EXCEPT DATA FROM TABLE system.users TO {excluded_backup}"
+    )
+
+    control_backup = new_backup_name()
+    instance.query(f"BACKUP TABLE system.users TO {control_backup}")
+
+    instance.query("DROP USER u_except_data")
+
+    # The element is in the backup, so the RESTORE itself succeeds ...
+    instance.query(f"RESTORE TABLE system.users FROM {excluded_backup}")
+    # ... but it carries no entities, so the user does not come back.
+    assert (
+        instance.query("SELECT count() FROM system.users WHERE name = 'u_except_data'")
+        == "0\n"
+    )
+
+    # Control: without the clause, the same RESTORE does bring the user back.
+    instance.query(f"RESTORE TABLE system.users FROM {control_backup}")
+    assert (
+        instance.query("SELECT count() FROM system.users WHERE name = 'u_except_data'")
+        == "1\n"
+    )
+
+    instance.query("DROP USER IF EXISTS u_except_data")
