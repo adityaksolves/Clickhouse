@@ -104,7 +104,7 @@ namespace
     {
         /// Inner tables are never named by the BACKUP query: they are backed up through their outer table
         /// (a materialized view, a TimeSeries table), which is also where the exclusion has to be written.
-        if (BackupUtils::isInnerTable(database_name, table_name))
+        if (BackupUtils::isInnerTableForBackup(database_name, table_name))
         {
             throw Exception(
                 ErrorCodes::INNER_TABLE_NOT_ALLOWED_IN_BACKUP_EXCLUSION,
@@ -677,7 +677,7 @@ std::vector<std::pair<ASTPtr, StoragePtr>> BackupEntriesCollector::findTablesInD
 
     auto filter_by_table_name = [&](const String & table_name)
     {
-        if (BackupUtils::isInnerTable(database_name, table_name))
+        if (BackupUtils::isInnerTableForBackup(database_name, table_name))
             return false;
 
         if (database_info.tables.contains(table_name))

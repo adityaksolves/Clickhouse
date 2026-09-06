@@ -1,6 +1,7 @@
 #include <Access/Common/AccessRightsElement.h>
 #include <Backups/BackupUtils.h>
 #include <Backups/DDLAdjustingForBackupVisitor.h>
+#include <Core/UUID.h>
 #include <Databases/DDLRenamingVisitor.h>
 #include <Databases/LoadingStrictnessLevel.h>
 #include <IO/ReadHelpers.h>
@@ -151,27 +152,49 @@ bool isInnerTable(const QualifiedTableName & table_name)
 bool isInnerTable(const String & /* database_name */, const String & table_name)
 {
     /// Inner tables of materialized views and of TimeSeries tables. They're backed up through their outer table.
-    if (table_name.starts_with(".inner.") || table_name.starts_with(".inner_id.") || table_name.starts_with(".tmp.inner.") || table_name.starts_with(".tmp.inner_id."))
+    /// These name prefixes are reserved, so the name alone is enough to tell.
+    return table_name.starts_with(".inner.") || table_name.starts_with(".inner_id.")
+        || table_name.starts_with(".tmp.inner.") || table_name.starts_with(".tmp.inner_id.");
+}
+
+bool isInnerTableForBackup(const String & database_name, const String & table_name)
+{
+    if (isInnerTable(database_name, table_name))
         return true;
 
 #if USE_LIBPQXX
     /// A standalone MaterializedPostgreSQL table keeps its rows in a nested table named
     /// `<uuid of the outer table>_nested`, see `StorageMaterializedPostgreSQL::getNestedTableName`. That name
-    /// carries no `.inner` prefix, so it has to be recognised by its own shape.
-    ///
-    /// The part before the suffix must parse as a UUID: checking only the suffix would classify an ordinary
-    /// user table called e.g. `events_nested` as inner and silently drop its data from every backup.
+    /// carries no reserved prefix, and `_nested` is not a reserved suffix either: an ordinary user table may
+    /// legitimately be called `events_nested`, or even `<some uuid>_nested`. Treating the shape as proof would
+    /// drop such a table from every backup, so the name is only a hint about which table would own a nested
+    /// table of that name - the answer comes from that outer table itself.
     static constexpr std::string_view nested_suffix = StorageMaterializedPostgreSQL::NESTED_TABLE_SUFFIX;
-    if (table_name.size() > nested_suffix.size() && table_name.ends_with(nested_suffix))
-    {
-        const std::string_view uuid_part{table_name.data(), table_name.size() - nested_suffix.size()};
-        UUID parsed_uuid;
-        if (tryParseUUID({reinterpret_cast<const UInt8 *>(uuid_part.data()), uuid_part.size()}, parsed_uuid))
-            return true;
-    }
-#endif
+    if (table_name.size() <= nested_suffix.size() || !table_name.ends_with(nested_suffix))
+        return false;
 
+    const std::string_view uuid_part{table_name.data(), table_name.size() - nested_suffix.size()};
+    /// A nil UUID cannot identify an outer table. Tables of an `Ordinary` database have no UUID at all, so a
+    /// MaterializedPostgreSQL table there names its nested table after the nil UUID and cannot be recognised
+    /// this way - two of them would collide on that name to begin with. Such a nested table is backed up as a
+    /// table of its own, which is what happens on `master` as well.
+    UUID outer_uuid;
+    if (!tryParseUUID({reinterpret_cast<const UInt8 *>(uuid_part.data()), uuid_part.size()}, outer_uuid)
+        || outer_uuid == UUIDHelpers::Nil)
+        return false;
+
+    auto outer_storage = DatabaseCatalog::instance().tryGetByUUID(outer_uuid).second;
+    const auto * materialized_postgresql = typeid_cast<const StorageMaterializedPostgreSQL *>(outer_storage.get());
+    if (!materialized_postgresql)
+        return false;
+
+    /// The outer table must be in the same database and must be the one which named this table: a
+    /// MaterializedPostgreSQL *database* engine names its nested tables differently.
+    return materialized_postgresql->getStorageID().database_name == database_name
+        && materialized_postgresql->getNestedTableName() == table_name;
+#else
     return false;
+#endif
 }
 
 }
