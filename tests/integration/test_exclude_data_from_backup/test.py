@@ -992,3 +992,230 @@ def test_backup_ordinary_table_whose_name_looks_like_a_nested_table():
     assert instance.query(f"SELECT count() FROM nested_name_db.`{alias_like}`") == "2\n"
 
     instance.query("DROP DATABASE nested_name_db")
+
+
+def test_except_tables_overlapping_database_and_all_elements_keep_table():
+    """`EXCEPT TABLES` written on one element must not drop a table another element selects.
+
+    The trace from the review:
+
+        BACKUP DATABASE db EXCEPT DATA FROM TABLE db.t, ALL EXCEPT TABLES db.t
+
+    `DATABASE db` selects `db.t` and asks only for its data to be left out, so `db.t` has to reach
+    the backup empty. Before the fix the two elements' `EXCEPT TABLES` names were merged into one
+    database-wide set, so `findTablesInDatabase` rejected `t` outright and neither its DDL nor its
+    data was written.
+    """
+    instance.query("DROP DATABASE IF EXISTS except_tables_db")
+    instance.query("CREATE DATABASE except_tables_db")
+    instance.query(
+        "CREATE TABLE except_tables_db.t (id UInt64) ENGINE = MergeTree ORDER BY id"
+    )
+    instance.query("INSERT INTO except_tables_db.t VALUES (1), (2), (3)")
+
+    # Control: the `ALL` element on its own really does drop the table, so the difference below is
+    # the first element and nothing else.
+    control_backup = new_backup_name()
+    instance.query(
+        f"BACKUP ALL EXCEPT DATABASE system EXCEPT TABLES except_tables_db.t TO {control_backup}"
+    )
+
+    overlapping_backup = new_backup_name()
+    instance.query(
+        f"BACKUP DATABASE except_tables_db EXCEPT DATA FROM TABLE except_tables_db.t, "
+        f"ALL EXCEPT DATABASE system EXCEPT TABLES except_tables_db.t TO {overlapping_backup}"
+    )
+
+    instance.query("DROP DATABASE except_tables_db")
+    instance.query(f"RESTORE DATABASE except_tables_db FROM {control_backup}")
+    assert (
+        instance.query(
+            "SELECT count() FROM system.tables WHERE database = 'except_tables_db' AND name = 't'"
+        )
+        == "0\n"
+    )
+
+    instance.query("DROP DATABASE except_tables_db")
+    instance.query(f"RESTORE DATABASE except_tables_db FROM {overlapping_backup}")
+    # The DDL is back and the data is not: exactly what the first element asked for.
+    assert (
+        instance.query(
+            "SELECT count() FROM system.tables WHERE database = 'except_tables_db' AND name = 't'"
+        )
+        == "1\n"
+    )
+    assert instance.query("SELECT count() FROM except_tables_db.t") == "0\n"
+
+    instance.query("DROP DATABASE except_tables_db")
+
+
+def test_except_tables_element_asking_for_the_whole_table_wins():
+    """An element that wants the table outright beats another element's `EXCEPT TABLES`.
+
+    `BACKUP DATABASE db, ALL EXCEPT TABLES db.t` - the first element asks for `db.t` with its data,
+    so both the DDL and the rows have to survive. This is the same rule as the test above with the
+    data left in, and it is the case that shows the merged set is gone rather than merely narrowed.
+    """
+    instance.query("DROP DATABASE IF EXISTS except_tables_whole_db")
+    instance.query("CREATE DATABASE except_tables_whole_db")
+    instance.query(
+        "CREATE TABLE except_tables_whole_db.t (id UInt64) ENGINE = MergeTree ORDER BY id"
+    )
+    instance.query("INSERT INTO except_tables_whole_db.t VALUES (1), (2), (3)")
+
+    backup = new_backup_name()
+    instance.query(
+        f"BACKUP DATABASE except_tables_whole_db, "
+        f"ALL EXCEPT DATABASE system EXCEPT TABLES except_tables_whole_db.t TO {backup}"
+    )
+
+    instance.query("DROP DATABASE except_tables_whole_db")
+    instance.query(f"RESTORE DATABASE except_tables_whole_db FROM {backup}")
+    assert instance.query("SELECT count() FROM except_tables_whole_db.t") == "3\n"
+
+    instance.query("DROP DATABASE except_tables_whole_db")
+
+
+def test_except_tables_excluded_by_every_element_is_still_excluded():
+    """The fail-safe rule must not turn into "never exclude anything".
+
+    When no element asks for the table it still has to be dropped, DDL included. Without this the
+    two tests above would also be satisfied by an `EXCEPT TABLES` clause that excluded nothing.
+    """
+    instance.query("DROP DATABASE IF EXISTS except_tables_guard_db")
+    instance.query("CREATE DATABASE except_tables_guard_db")
+    instance.query(
+        "CREATE TABLE except_tables_guard_db.t (id UInt64) ENGINE = MergeTree ORDER BY id"
+    )
+    instance.query("INSERT INTO except_tables_guard_db.t VALUES (1), (2), (3)")
+    instance.query(
+        "CREATE TABLE except_tables_guard_db.other (id UInt64) ENGINE = MergeTree ORDER BY id"
+    )
+    instance.query("INSERT INTO except_tables_guard_db.other VALUES (1), (2)")
+
+    backup = new_backup_name()
+    instance.query(
+        f"BACKUP DATABASE except_tables_guard_db EXCEPT TABLES except_tables_guard_db.t TO {backup}"
+    )
+
+    instance.query("DROP DATABASE except_tables_guard_db")
+    instance.query(f"RESTORE DATABASE except_tables_guard_db FROM {backup}")
+    assert (
+        instance.query(
+            "SELECT count() FROM system.tables WHERE database = 'except_tables_guard_db' AND name = 't'"
+        )
+        == "0\n"
+    )
+    # The sibling table proves the element itself worked rather than the whole backup being empty.
+    assert instance.query("SELECT count() FROM except_tables_guard_db.other") == "2\n"
+
+    instance.query("DROP DATABASE except_tables_guard_db")
+
+
+def test_except_tables_three_overlapping_elements():
+    """Three elements covering the same table, not two.
+
+    The first two exclude only the data, the third excludes the table itself. The table is selected
+    (twice) and no element asks for its data, so the DDL survives and the rows do not. A second arm
+    swaps the middle element for one that asks for the table outright, which flips the data back on
+    and shows the outcome tracks the elements rather than their number or order in the list.
+    """
+    instance.query("DROP DATABASE IF EXISTS except_tables_three_db")
+    instance.query("CREATE DATABASE except_tables_three_db")
+    instance.query(
+        "CREATE TABLE except_tables_three_db.t (id UInt64) ENGINE = MergeTree ORDER BY id"
+    )
+    instance.query("INSERT INTO except_tables_three_db.t VALUES (1), (2), (3)")
+
+    data_excluded_backup = new_backup_name()
+    instance.query(
+        f"BACKUP DATABASE except_tables_three_db EXCEPT DATA FROM TABLE except_tables_three_db.t, "
+        f"DATABASE except_tables_three_db EXCEPT DATA FROM TABLE except_tables_three_db.t, "
+        f"ALL EXCEPT DATABASE system EXCEPT TABLES except_tables_three_db.t "
+        f"TO {data_excluded_backup}"
+    )
+
+    data_wanted_backup = new_backup_name()
+    instance.query(
+        f"BACKUP DATABASE except_tables_three_db EXCEPT DATA FROM TABLE except_tables_three_db.t, "
+        f"DATABASE except_tables_three_db, "
+        f"ALL EXCEPT DATABASE system EXCEPT TABLES except_tables_three_db.t "
+        f"TO {data_wanted_backup}"
+    )
+
+    instance.query("DROP DATABASE except_tables_three_db")
+    instance.query(f"RESTORE DATABASE except_tables_three_db FROM {data_excluded_backup}")
+    assert instance.query("SELECT count() FROM except_tables_three_db.t") == "0\n"
+
+    instance.query("DROP DATABASE except_tables_three_db")
+    instance.query(f"RESTORE DATABASE except_tables_three_db FROM {data_wanted_backup}")
+    assert instance.query("SELECT count() FROM except_tables_three_db.t") == "3\n"
+
+    instance.query("DROP DATABASE except_tables_three_db")
+
+
+def test_except_tables_and_except_data_naming_the_same_table_on_one_element():
+    """One element naming the same table in both `EXCEPT TABLES` and `EXCEPT DATA FROM TABLE`.
+
+    The parser accepts this ordering (the reverse, `EXCEPT DATA FROM TABLE` before
+    `EXCEPT TABLES`, is a syntax error), so it is a case a user can write and the two clauses
+    disagree about the same table on the same element.
+
+    `EXCEPT TABLES` wins, because it settles a question the other clause never reaches: the element
+    does not select the table at all, so it has no data for the element to have an opinion about.
+    That is not the "least exclusion wins" rule being broken - that rule arbitrates *between*
+    elements, and here there is one element whose two clauses are about different things.
+
+    The second arm is the same wide element with another element that does want the table. The
+    wide element's clauses are scoped to itself, so its `EXCEPT DATA FROM TABLE` must not reach the
+    table the other element asked for - only the first arm can be satisfied by a predicate that
+    excludes too much, and only the second by one that excludes too little.
+    """
+    instance.query("DROP DATABASE IF EXISTS except_tables_mixed_db")
+    instance.query("CREATE DATABASE except_tables_mixed_db")
+    instance.query(
+        "CREATE TABLE except_tables_mixed_db.t (id UInt64) ENGINE = MergeTree ORDER BY id"
+    )
+    instance.query("INSERT INTO except_tables_mixed_db.t VALUES (1), (2), (3)")
+    instance.query(
+        "CREATE TABLE except_tables_mixed_db.other (id UInt64) ENGINE = MergeTree ORDER BY id"
+    )
+    instance.query("INSERT INTO except_tables_mixed_db.other VALUES (1), (2)")
+
+    both_clauses_backup = new_backup_name()
+    instance.query(
+        f"BACKUP DATABASE except_tables_mixed_db "
+        f"EXCEPT TABLES except_tables_mixed_db.t "
+        f"EXCEPT DATA FROM TABLE except_tables_mixed_db.t TO {both_clauses_backup}"
+    )
+
+    other_element_wants_it_backup = new_backup_name()
+    instance.query(
+        f"BACKUP DATABASE except_tables_mixed_db, "
+        f"ALL EXCEPT DATABASE system "
+        f"EXCEPT TABLES except_tables_mixed_db.t "
+        f"EXCEPT DATA FROM TABLE except_tables_mixed_db.t "
+        f"TO {other_element_wants_it_backup}"
+    )
+
+    instance.query("DROP DATABASE except_tables_mixed_db")
+    instance.query(f"RESTORE DATABASE except_tables_mixed_db FROM {both_clauses_backup}")
+    # `EXCEPT TABLES` settled it: the table is not in the backup at all, DDL included.
+    assert (
+        instance.query(
+            "SELECT count() FROM system.tables "
+            "WHERE database = 'except_tables_mixed_db' AND name = 't'"
+        )
+        == "0\n"
+    )
+    # The sibling table pins that the element worked rather than the backup being empty.
+    assert instance.query("SELECT count() FROM except_tables_mixed_db.other") == "2\n"
+
+    instance.query("DROP DATABASE except_tables_mixed_db")
+    instance.query(
+        f"RESTORE DATABASE except_tables_mixed_db FROM {other_element_wants_it_backup}"
+    )
+    # Neither of the wide element's clauses reaches the table the first element asked for.
+    assert instance.query("SELECT count() FROM except_tables_mixed_db.t") == "3\n"
+
+    instance.query("DROP DATABASE except_tables_mixed_db")
