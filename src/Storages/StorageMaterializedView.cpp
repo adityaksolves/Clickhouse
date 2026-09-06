@@ -33,8 +33,6 @@
 #include <Storages/ReadInOrderOptimizer.h>
 #include <Storages/SelectQueryDescription.h>
 #include <Storages/VirtualColumnUtils.h>
-#include <Storages/MergeTree/MergeTreeData.h>
-#include <Storages/MergeTree/MergeTreeSettings.h>
 
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
@@ -72,7 +70,6 @@ namespace RefreshSetting
 {
     extern const RefreshSettingsBool all_replicas;
 }
-
 
 namespace ErrorCodes
 {
@@ -1009,9 +1006,7 @@ void StorageMaterializedView::backupData(BackupEntriesCollector & backup_entries
         }
 
         if (auto table = tryGetTargetTable())
-        {
             table->backupData(backup_entries_collector, data_path_in_backup, partitions);
-        }
         else
             LOG_WARNING(getLogger("StorageMaterializedView"),
                         "Inner table does not exist, will not backup any data");

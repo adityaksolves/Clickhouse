@@ -231,7 +231,7 @@ def test_except_data_rejects_inner_table_name():
     # Should throw error when trying to use inner table name directly
     # The error can be either:
     # 1. SYNTAX_ERROR (62) - parser rejects dot-prefixed identifier
-    # 2. INNER_TABLE_NOT_ALLOWED_IN_BACKUP_EXCLUSION (666) - our validation
+    # 2. INNER_TABLE_NOT_ALLOWED_IN_BACKUP_EXCLUSION - our validation
     try:
         # Try with backticks to bypass parser's identifier check
         instance.query(f"BACKUP DATABASE test EXCEPT DATA FROM TABLE `{inner_table}` TO {backup_name}")
@@ -240,9 +240,8 @@ def test_except_data_rejects_inner_table_name():
         error_message = str(e)
         # Backtick-quoting bypasses the parser, so this must be rejected by our
         # explicit validation layer specifically - not by parser SYNTAX_ERROR.
-        assert ("INNER_TABLE_NOT_ALLOWED_IN_BACKUP_EXCLUSION" in error_message or
-                "666" in error_message), \
-            f"Expected INNER_TABLE_NOT_ALLOWED_IN_BACKUP_EXCLUSION (666), got: {error_message}"
+        assert "INNER_TABLE_NOT_ALLOWED_IN_BACKUP_EXCLUSION" in error_message, \
+            f"Expected INNER_TABLE_NOT_ALLOWED_IN_BACKUP_EXCLUSION, got: {error_message}"
 
     instance.query("DROP DATABASE test")
 
