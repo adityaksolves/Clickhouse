@@ -544,14 +544,10 @@ void BackupEntriesCollector::gatherDatabaseMetadata(
         /// while no other element asks for the same table without excluding its data (such an element wants
         /// the data, so it wins - see `DatabaseInfo::TableParams::except_data`).
         table_params.except_data = inserted ? exclude_table_data : (table_params.except_data && exclude_table_data);
-
-        database_info.except_table_names.emplace(*table_name);
     }
 
     if (all_tables)
     {
-        database_info.all_tables = all_tables;
-
         /// One call with `all_tables` is one DATABASE or ALL element covering this database, so this is where an
         /// element's own view of the database gets recorded.
         auto & element_info = database_info.all_tables_elements.emplace_back();
@@ -561,7 +557,6 @@ void BackupEntriesCollector::gatherDatabaseMetadata(
             if (except_table_name.first != database_name)
                 continue;
 
-            database_info.except_table_names.emplace(except_table_name.second);
             element_info.except_table_names.emplace(except_table_name.second);
         }
 
@@ -680,13 +675,7 @@ std::vector<std::pair<ASTPtr, StoragePtr>> BackupEntriesCollector::findTablesInD
         if (BackupUtils::isInnerTableForBackup(database_name, table_name))
             return false;
 
-        if (database_info.tables.contains(table_name))
-            return true;
-
-        if (database_info.all_tables)
-            return !database_info.except_table_names.contains(table_name);
-
-        return false;
+        return database_info.isTableSelectedByAnyElement(table_name);
     };
 
     std::vector<std::pair<ASTPtr, StoragePtr>> db_tables;
@@ -968,6 +957,25 @@ bool BackupEntriesCollector::shouldBackupTableData(
     return true;
 }
 
+bool BackupEntriesCollector::DatabaseInfo::isTableSelectedByAnyElement(const String & table_name) const
+{
+    /// A table named by an element of its own is selected even when a wider element excludes it: the element
+    /// naming it asks for it, and that request wins.
+    if (tables.contains(table_name))
+        return true;
+
+    /// A DATABASE or ALL element selects every table of the database except the ones its own EXCEPT TABLES
+    /// names. The elements are asked one by one rather than through a merged set of names, because a name
+    /// excluded by one element says nothing about the others - one element selecting the table is enough.
+    for (const auto & element : all_tables_elements)
+    {
+        if (!element.except_table_names.contains(table_name))
+            return true;
+    }
+
+    return false;
+}
+
 bool BackupEntriesCollector::isTableDataExcluded(const QualifiedTableName & table_name) const
 {
     auto it = database_infos.find(table_name.database);
@@ -980,19 +988,17 @@ bool BackupEntriesCollector::isTableDataExcluded(const QualifiedTableName & tabl
     /// asking for the table without the clause is asking for its data, and that request wins: backing up data
     /// the user meant to exclude is a far smaller harm than silently dropping data they asked for.
     ///
-    /// This subsumes the precedence `findTablesInDatabase` applies to EXCEPT TABLES - a table named by an
-    /// element of its own keeps its data even though a wider element excluded it - because such an element is
-    /// one of the elements that wants the data.
-    bool selected_by_any_element = false;
+    /// Whether the table is selected at all is the same question `findTablesInDatabase` asks, so it is asked
+    /// through the same predicate: the two must not be able to drift apart.
+    if (!database_info.isTableSelectedByAnyElement(table_name.table))
+        return false;
+
     bool wanted_by_any_element = false;
 
     /// `TableParams::except_data` has already intersected every single-table element naming this table, so it
     /// is false as soon as one of them asked for the data.
     if (auto table_it = database_info.tables.find(table_name.table); table_it != database_info.tables.end())
-    {
-        selected_by_any_element = true;
         wanted_by_any_element = !table_it->second.except_data;
-    }
 
     for (const auto & element : database_info.all_tables_elements)
     {
@@ -1000,12 +1006,11 @@ bool BackupEntriesCollector::isTableDataExcluded(const QualifiedTableName & tabl
         if (element.except_table_names.contains(table_name.table))
             continue;
 
-        selected_by_any_element = true;
         if (!element.except_data_table_names.contains(table_name.table))
             wanted_by_any_element = true;
     }
 
-    return selected_by_any_element && !wanted_by_any_element;
+    return !wanted_by_any_element;
 }
 
 void BackupEntriesCollector::addBackupEntryUnlocked(const String & file_name, BackupEntryPtr backup_entry)

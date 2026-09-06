@@ -172,25 +172,27 @@ private:
         /// Tables named explicitly by single-table elements of the BACKUP query.
         std::unordered_map<String, TableParams> tables;
 
-        bool all_tables = false;
-        std::unordered_set<String> except_table_names;
-
         /// One entry per DATABASE or ALL element of the query covering this database, holding that element's
         /// own EXCEPT TABLES and EXCEPT DATA FROM TABLE/TABLES names. Exclusions written on a single-table
         /// element are not here: those are element-scoped and live in `tables[...].except_data`.
         ///
-        /// The elements are kept apart rather than merged into one set of names because the question
-        /// `isTableDataExcluded` has to answer is per element - a table's data is dropped only when *every*
-        /// element selecting the table also excludes its data. Merging would erase the elements that asked for
-        /// the data, and their request is the one that must win.
+        /// The elements are kept apart rather than merged into one set of names because both questions asked
+        /// of them are per element: a table is selected when *any* element selects it, and its data is dropped
+        /// only when *every* element selecting it also excludes the data. Merging erases the elements that
+        /// asked for the table or its data, and theirs is the request that must win.
         struct AllTablesElement
         {
-            /// Names this element does not select at all, so it has no say about their data.
+            /// Names this element does not select at all, so it has no say about them or their data.
             std::unordered_set<String> except_table_names;
             /// Names this element selects but whose data it excludes.
             std::unordered_set<String> except_data_table_names;
         };
         std::vector<AllTablesElement> all_tables_elements;
+
+        /// Whether at least one element of the query selects this table. Both the selection of tables in
+        /// `findTablesInDatabase` and `isTableDataExcluded` ask this, and they must agree: a table dropped
+        /// here is never enumerated, so no later decision about its data can bring it back.
+        bool isTableSelectedByAnyElement(const String & table_name) const;
     };
 
     struct TableInfo
